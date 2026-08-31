@@ -2,6 +2,8 @@ import AppKit
 import CryptoKit
 import Foundation
 import Security
+import ServiceManagement
+import SwiftUI
 
 @_silgen_name("AuthorizationExecuteWithPrivileges")
 private func executeWithPrivileges(
@@ -40,7 +42,7 @@ struct GitHubReleaseAsset: Decodable {
 }
 
 @main
-struct ZapretMacMain {
+struct NimbusMain {
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
@@ -50,15 +52,11 @@ struct ZapretMacMain {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let fileManager = FileManager.default
-    private let menu = NSMenu()
     private var statusItem: NSStatusItem!
-    private var startStopItem = NSMenuItem()
-    private var testItem = NSMenuItem()
-    private var versionItem = NSMenuItem()
-    private var strategyItems: [NSMenuItem] = []
-    private var ipsetItems: [NSMenuItem] = []
+    private let hudModel = HUDModel()
+    private var hud: HUDController!
     private var strategies: [Strategy] = []
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -70,8 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var availableRelease: GitHubRelease?
     private var authorization: AuthorizationRef?
 
-    private let releaseURL = URL(string: "https://api.github.com/repos/Flowseal/zapret-mac-discord-youtube/releases")!
-    private let releaseAssetName = "ZapretMac-macOS-universal.zip"
+    private let releaseURL = URL(string: "https://api.github.com/repos/samevamp/Nimbus/releases")!
+    private let releaseAssetName = "Nimbus-macOS-universal.zip"
 
     private var dataRoot: URL {
         fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -91,20 +89,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil)
             return
         }
-        buildMenu()
-        refreshMenu()
+        buildStatusItem()
+        refreshHUD()
         showPendingUpdateError()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            self?.refreshMenu()
+            self?.refreshHUD()
         }
         checkForUpdate()
         updateTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.checkForUpdate()
         }
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        refreshMenu()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -141,118 +135,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func buildMenu() {
+    private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.menu = menu
-        menu.delegate = self
-
-        startStopItem = NSMenuItem(title: "Запустить", action: #selector(toggleService), keyEquivalent: "")
-        startStopItem.target = self
-        menu.addItem(startStopItem)
-
-        let strategyRoot = NSMenuItem(title: "Выбор стратегии", action: nil, keyEquivalent: "")
-        let strategyMenu = NSMenu()
-        for strategy in strategies {
-            let item = NSMenuItem(title: strategy.name, action: #selector(selectStrategy(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = strategy.id
-            strategyMenu.addItem(item)
-            strategyItems.append(item)
+        if let button = statusItem.button {
+            let image = NSImage(systemSymbolName: "cloud.fill", accessibilityDescription: "Nimbus")
+            image?.isTemplate = true
+            button.image = image
+            button.target = self
+            button.action = #selector(toggleHUD)
+            button.sendAction(on: [.leftMouseUp])
         }
-        strategyRoot.submenu = strategyMenu
-        menu.addItem(strategyRoot)
-
-        let ipsetRoot = NSMenuItem(title: "Переключить IPSet", action: nil, keyEquivalent: "")
-        let ipsetMenu = NSMenu()
-        for mode in ["none", "loaded", "any"] {
-            let item = NSMenuItem(title: mode, action: #selector(selectIPSet(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = mode
-            ipsetMenu.addItem(item)
-            ipsetItems.append(item)
-        }
-        ipsetRoot.submenu = ipsetMenu
-        menu.addItem(ipsetRoot)
-
-        menu.addItem(.separator())
-        testItem = NSMenuItem(title: "Тест стратегий", action: #selector(testStrategies), keyEquivalent: "")
-        testItem.target = self
-        menu.addItem(testItem)
-        let openLists = NSMenuItem(title: "Открыть списки", action: #selector(openLists), keyEquivalent: "")
-        openLists.target = self
-        menu.addItem(openLists)
-        menu.addItem(.separator())
-        versionItem = NSMenuItem(title: versionTitle, action: #selector(installUpdate), keyEquivalent: "")
-        versionItem.target = self
-        menu.addItem(versionItem)
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Выход", action: #selector(quitApp), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
+        hud = HUDController(model: hudModel)
+        hudModel.toggleService = { [weak self] in self?.toggleService() }
+        hudModel.selectStrategy = { [weak self] id in self?.selectStrategy(id: id) }
+        hudModel.selectIPSet = { [weak self] mode in self?.selectIPSet(mode: mode) }
+        hudModel.toggleLogin = { [weak self] in self?.toggleLoginItem() }
+        hudModel.testStrategies = { [weak self] in self?.testStrategies() }
+        hudModel.openLists = { [weak self] in self?.openLists() }
+        hudModel.installUpdate = { [weak self] in self?.installUpdate() }
+        hudModel.quit = { [weak self] in self?.quitApp() }
     }
 
-    private func refreshMenu() {
+    @objc private func toggleHUD() {
+        guard let button = statusItem.button else { return }
+        hud.toggle(relativeTo: button)
+    }
+
+    private func refreshHUD() {
         guard statusItem != nil else { return }
         let running = isRunning()
-        startStopItem.title = running ? "Остановить" : "Запустить"
-        statusItem.button?.image = statusIcon(running: running)
-        statusItem.button?.toolTip = running ? "ZapretMac запущен" : "ZapretMac остановлен"
+        if let button = statusItem.button {
+            button.contentTintColor = running ? nimbusNSBlue : nil
+            button.toolTip = running ? "Nimbus включён" : "Nimbus выключен"
+        }
         let selectedStrategy = readState(from: dataRoot.appendingPathComponent("selected-strategy"))
-        for item in strategyItems {
-            item.state = item.representedObject as? String == selectedStrategy ? .on : .off
-            item.isEnabled = !busy
-        }
         let selectedIPSet = readState(from: dataRoot.appendingPathComponent("ipset-mode"))
-        for item in ipsetItems {
-            item.state = item.representedObject as? String == selectedIPSet ? .on : .off
-            item.isEnabled = !busy
-        }
-        startStopItem.isEnabled = !busy
+        hudModel.running = running
+        hudModel.busy = busy
+        hudModel.testing = testing
+        hudModel.cancellingTest = cancellingTest
+        hudModel.updating = updating
+        hudModel.strategies = strategies
+        hudModel.selectedStrategyID = selectedStrategy
+        hudModel.strategyName = strategies.first(where: { $0.id == selectedStrategy })?.name ?? selectedStrategy
+        hudModel.ipsetMode = selectedIPSet.isEmpty ? "none" : selectedIPSet
+        hudModel.loginEnabled = SMAppService.mainApp.status == .enabled
         if testing {
             let progress = readState(from: dataRoot.appendingPathComponent("strategy-test-progress"))
             if cancellingTest {
-                testItem.title = "Остановка теста…"
+                hudModel.testTitle = "Остановка теста…"
             } else {
-                testItem.title = progress.isEmpty ? "Остановить" : "Остановить — \(progress)"
+                hudModel.testTitle = progress.isEmpty ? "Остановить тест" : "Остановить — \(progress)"
             }
+            hudModel.testEnabled = !cancellingTest
         } else {
-            testItem.title = "Тест стратегий"
+            hudModel.testTitle = "Тест стратегий"
+            hudModel.testEnabled = !busy
         }
-        testItem.isEnabled = testing ? !cancellingTest : !busy
         if updating {
-            versionItem.title = "Установка обновления.."
+            hudModel.versionTitle = "Установка обновления…"
+            hudModel.canInstallUpdate = false
         } else if let release = availableRelease {
-            versionItem.title = "Версия \(currentVersion) — обновить до \(displayVersion(release.tagName))"
+            hudModel.versionTitle = "Обновить до \(displayVersion(release.tagName))"
+            hudModel.canInstallUpdate = !busy && !testing
         } else {
-            versionItem.title = versionTitle
+            hudModel.versionTitle = "Версия \(currentVersion)"
+            hudModel.canInstallUpdate = false
         }
-        versionItem.isEnabled = availableRelease != nil && !busy && !testing && !updating
-    }
-
-    private func statusIcon(running: Bool) -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 18))
-        image.lockFocus()
-        NSColor.black.setStroke()
-        let z = NSBezierPath()
-        z.lineWidth = 2
-        z.lineCapStyle = .round
-        z.lineJoinStyle = .round
-        z.move(to: NSPoint(x: 4, y: 14))
-        z.line(to: NSPoint(x: 14, y: 14))
-        z.line(to: NSPoint(x: 4, y: 4))
-        z.line(to: NSPoint(x: 14, y: 4))
-        z.stroke()
-        if !running {
-            let slash = NSBezierPath()
-            slash.lineWidth = 2.4
-            slash.lineCapStyle = .round
-            slash.move(to: NSPoint(x: 3, y: 15))
-            slash.line(to: NSPoint(x: 15, y: 3))
-            slash.stroke()
-        }
-        image.unlockFocus()
-        image.isTemplate = true
-        return image
     }
 
     private func isRunning() -> Bool {
@@ -287,22 +236,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func selectStrategy(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
+    private func selectStrategy(id: String) {
         do {
             try writeState(id, to: dataRoot.appendingPathComponent("selected-strategy"))
-            refreshMenu()
+            refreshHUD()
             applyIfRunning()
         } catch {
             showError(error.localizedDescription)
         }
     }
 
-    @objc private func selectIPSet(_ sender: NSMenuItem) {
-        guard let mode = sender.representedObject as? String else { return }
+    private func selectIPSet(mode: String) {
         do {
             try writeState(mode, to: dataRoot.appendingPathComponent("ipset-mode"))
-            refreshMenu()
+            refreshHUD()
             applyIfRunning()
         } catch {
             showError(error.localizedDescription)
@@ -319,12 +266,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(dataRoot.appendingPathComponent("lists", isDirectory: true))
     }
 
-    private var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    private func toggleLoginItem() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+            refreshHUD()
+        } catch {
+            showError("Не удалось изменить автозапуск: \(error.localizedDescription)")
+        }
     }
 
-    private var versionTitle: String {
-        "Версия \(currentVersion)"
+    private var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
     }
 
     private func displayVersion(_ version: String) -> String {
@@ -341,7 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let url = URL(string: releaseURL.absoluteString + "?t=\(Int(Date().timeIntervalSince1970 * 1000))&per_page=1")!
         var request = URLRequest(url: url, timeoutInterval: 12)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("zapret-mac", forHTTPHeaderField: "User-Agent")
+        request.setValue("Nimbus", forHTTPHeaderField: "User-Agent")
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             guard let self else { return }
             var release: GitHubRelease?
@@ -362,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if completed {
                     self.availableRelease = release
                 }
-                self.refreshMenu()
+                self.refreshHUD()
             }
         }.resume()
     }
@@ -378,16 +334,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let target = Bundle.main.bundleURL.standardizedFileURL
         guard target.pathExtension == "app",
               !target.path.contains("/AppTranslocation/") else {
-            showError("Переместите ZapretMac.app из защищённой папки (например, в папку Applications) и запустите снова")
+            showError("Переместите Nimbus.app в папку Программы и запустите снова")
             return
         }
         updating = true
-        refreshMenu()
+        refreshHUD()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let source = self.fileManager.temporaryDirectory.appendingPathComponent("ZapretMac-\(UUID().uuidString).zip")
+            let source = self.fileManager.temporaryDirectory.appendingPathComponent("Nimbus-\(UUID().uuidString).zip")
             do {
-                let arguments = ["-fL", "--connect-timeout", "5", "-A", "zapret-mac", "-o", source.path, asset.downloadURL.absoluteString]
+                let arguments = ["-fL", "--connect-timeout", "5", "-A", "Nimbus", "-o", source.path, asset.downloadURL.absoluteString]
                 do {
                     try self.runProcess("/usr/bin/curl", arguments: ["--resolve", "release-assets.githubusercontent.com:443:185.199.109.133", "--max-time", "30"] + arguments)
                 } catch {
@@ -402,7 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try? self.fileManager.removeItem(at: source)
                 DispatchQueue.main.async {
                     self.updating = false
-                    self.refreshMenu()
+                    self.refreshHUD()
                     self.showError(error.localizedDescription)
                 }
             }
@@ -410,7 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func prepareAndLaunchUpdate(source: URL, release: GitHubRelease, asset: GitHubReleaseAsset, target: URL) throws {
-        let workRoot = fileManager.temporaryDirectory.appendingPathComponent("ZapretMac-Update-\(UUID().uuidString)", isDirectory: true)
+        let workRoot = fileManager.temporaryDirectory.appendingPathComponent("Nimbus-Update-\(UUID().uuidString)", isDirectory: true)
         let archive = workRoot.appendingPathComponent(releaseAssetName)
         let extracted = workRoot.appendingPathComponent("extracted", isDirectory: true)
         do {
@@ -418,7 +374,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try fileManager.moveItem(at: source, to: archive)
             try verifyDigest(of: archive, expected: asset.digest)
             try runProcess("/usr/bin/ditto", arguments: ["-x", "-k", archive.path, extracted.path])
-            let app = extracted.appendingPathComponent("ZapretMac.app", isDirectory: true)
+            let app = extracted.appendingPathComponent("Nimbus.app", isDirectory: true)
             try verifyUpdate(app, version: release.tagName)
             let updater = payloadURL.appendingPathComponent("update-app.sh")
             let updaterCopy = workRoot.appendingPathComponent("update-app.sh")
@@ -431,7 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ].map(shellQuote).joined(separator: " ")) + " >\(shellQuote(log.path)) 2>&1 </dev/null &"
             let result = try executePrivileged(command: command)
             guard result.status == 0 else {
-                throw NSError(domain: "ZapretMac.Update", code: 2, userInfo: [NSLocalizedDescriptionKey: result.output.isEmpty ? "Не удалось запустить установку обновления" : result.output])
+                throw NSError(domain: "Nimbus.Update", code: 2, userInfo: [NSLocalizedDescriptionKey: result.output.isEmpty ? "Не удалось запустить установку обновления" : result.output])
             }
         } catch {
             try? fileManager.removeItem(at: workRoot)
@@ -444,7 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let data = try Data(contentsOf: archive, options: .mappedIfSafe)
         let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         guard actual.caseInsensitiveCompare(String(expected.dropFirst(7))) == .orderedSame else {
-            throw NSError(domain: "ZapretMac.Update", code: 3, userInfo: [NSLocalizedDescriptionKey: "Контрольная сумма обновления не совпала"])
+            throw NSError(domain: "Nimbus.Update", code: 3, userInfo: [NSLocalizedDescriptionKey: "Контрольная сумма обновления не совпала"])
         }
     }
 
@@ -454,10 +410,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               bundle.bundleIdentifier == Bundle.main.bundleIdentifier,
               let bundledVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
               displayVersion(bundledVersion) == self.bundledVersion(version) else {
-            throw NSError(domain: "ZapretMac.Update", code: 4, userInfo: [NSLocalizedDescriptionKey: "Архив релиза содержит неподходящую версию приложения"])
+            throw NSError(domain: "Nimbus.Update", code: 4, userInfo: [NSLocalizedDescriptionKey: "Архив релиза содержит неподходящую версию приложения"])
         }
         try runProcess("/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", app.path])
-        let executable = app.appendingPathComponent("Contents/MacOS/ZapretMac")
+        let executable = app.appendingPathComponent("Contents/MacOS/Nimbus")
         try runProcess("/usr/bin/lipo", arguments: [executable.path, "-verify_arch", "x86_64", "arm64"])
     }
 
@@ -473,7 +429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard process.terminationStatus == 0 else {
             let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
             let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw NSError(domain: "ZapretMac.Update", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message?.isEmpty == false ? message! : "Проверка обновления не пройдена"])
+            throw NSError(domain: "Nimbus.Update", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message?.isEmpty == false ? message! : "Проверка обновления не пройдена"])
         }
     }
 
@@ -491,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 try Data().write(to: cancel, options: .atomic)
                 cancellingTest = true
-                refreshMenu()
+                refreshHUD()
             } catch {
                 showError(error.localizedDescription)
             }
@@ -518,7 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.testing = false
             self.cancellingTest = false
             try? self.fileManager.removeItem(at: cancel)
-            self.refreshMenu()
+            self.refreshHUD()
             guard failure == nil else { return }
             if wasCancelled {
                 self.showInformation("Тест остановлен. Настройки восстановлены.")
@@ -543,13 +499,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runPrivileged(script: String, arguments: [String], completion: ((String?) -> Void)? = nil) {
         if busy { return }
         busy = true
-        refreshMenu()
+        refreshHUD()
         let payload = payloadURL
         let dataArguments = arguments
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var failure: String?
-            let stagingRoot = self.fileManager.temporaryDirectory.appendingPathComponent("ZapretMac-\(UUID().uuidString)", isDirectory: true)
+            let stagingRoot = self.fileManager.temporaryDirectory.appendingPathComponent("Nimbus-\(UUID().uuidString)", isDirectory: true)
             let stagedPayload = stagingRoot.appendingPathComponent("Payload", isDirectory: true)
             do {
                 try self.fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
@@ -577,7 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? self.fileManager.removeItem(at: stagingRoot)
             DispatchQueue.main.async {
                 self.busy = false
-                self.refreshMenu()
+                self.refreshHUD()
                 if let failure { self.showError(failure) }
                 completion?(failure)
             }
@@ -655,7 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
             alert.alertStyle = .critical
-            alert.messageText = "ZapretMac"
+            alert.messageText = "Nimbus"
             alert.informativeText = message
             alert.runModal()
         }
@@ -666,7 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
             alert.alertStyle = .informational
-            alert.messageText = "ZapretMac"
+            alert.messageText = "Nimbus"
             alert.informativeText = message
             alert.runModal()
         }
