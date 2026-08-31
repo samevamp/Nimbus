@@ -1,6 +1,9 @@
 name: Build macOS Universal
 
 on:
+  push:
+    branches: [master, nimbus-minibar]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -12,10 +15,10 @@ jobs:
         run: bash ./macos/build.sh
       - name: Verify architectures
         run: |
-          lipo -archs build/macos/ZapretMac.app/Contents/MacOS/ZapretMac
-          lipo -archs build/macos/ZapretMac.app/Contents/Resources/Payload/bin/utunws
+          lipo -archs build/macos/Nimbus.app/Contents/MacOS/Nimbus
+          lipo -archs build/macos/Nimbus.app/Contents/Resources/Payload/bin/utunws
       - uses: actions/upload-artifact@v4
         with:
-          name: ZapretMac-macOS-universal
-          path: dist/ZapretMac-macOS-universal.zip
+          name: Nimbus-macOS-universal
+          path: dist/Nimbus-macOS-universal.zip
           if-no-files-found: error
