@@ -67,6 +67,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var updating = false
     private var availableRelease: GitHubRelease?
     private var authorization: AuthorizationRef?
+    private var lastServiceProbe = Date.distantPast
+    private var lastLayoutKey = ""
+    private var lastIconRunning: Bool?
+    private var iconTimer: Timer?
+    private var iconPhase: Double = 0
+    private var noticeTimer: Timer?
 
     private let releaseURL = URL(string: "https://api.github.com/repos/samevamp/Nimbus/releases")!
     private let releaseAssetName = "Nimbus-macOS-universal.zip"
@@ -92,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildStatusItem()
         refreshHUD()
         showPendingUpdateError()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.refreshHUD()
         }
         checkForUpdate()
@@ -135,12 +141,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func templateCloud(running: Bool) -> NSImage? {
+        let name = running ? "cloud.fill" : "cloud"
+        let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: "Nimbus")?
+            .withSymbolConfiguration(config) else { return nil }
+        image.isTemplate = true
+        return image
+    }
+
     private func buildStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "cloud.fill", accessibilityDescription: "Nimbus")
-            image?.isTemplate = true
-            button.image = image
+            button.image = templateCloud(running: false)
+            button.image?.isTemplate = true
             button.target = self
             button.action = #selector(toggleHUD)
             button.sendAction(on: [.leftMouseUp])
@@ -151,9 +165,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hudModel.selectIPSet = { [weak self] mode in self?.selectIPSet(mode: mode) }
         hudModel.toggleLogin = { [weak self] in self?.toggleLoginItem() }
         hudModel.testStrategies = { [weak self] in self?.testStrategies() }
-        hudModel.openLists = { [weak self] in self?.openLists() }
+        hudModel.applyBest = { [weak self] in self?.applyBestStrategy() }
+        hudModel.applyTestRow = { [weak self] name in self?.applyNamedStrategy(name) }
+        hudModel.openLists = { [weak self] in self?.openListsPage() }
+        hudModel.openList = { [weak self] name in self?.openList(name) }
+        hudModel.saveList = { [weak self] in self?.saveCurrentList() }
+        hudModel.openLogs = { [weak self] in self?.openLogsPage() }
+        hudModel.copyLogs = { [weak self] in self?.copyLogs() }
+        hudModel.restartService = { [weak self] in self?.restartService() }
+        hudModel.openGitHub = { [weak self] in self?.openGitHub() }
         hudModel.installUpdate = { [weak self] in self?.installUpdate() }
         hudModel.quit = { [weak self] in self?.quitApp() }
+        hudModel.onShown = { [weak self] in self?.probeServices(force: true) }
+        hudModel.dismissNotice = { [weak self] in self?.dismissNotice() }
     }
 
     @objc private func toggleHUD() {
@@ -164,10 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshHUD() {
         guard statusItem != nil else { return }
         let running = isRunning()
-        if let button = statusItem.button {
-            button.contentTintColor = running ? nimbusNSBlue : nil
-            button.toolTip = running ? "Nimbus включён" : "Nimbus выключен"
-        }
+        updateMenuCloud(running: running)
         let selectedStrategy = readState(from: dataRoot.appendingPathComponent("selected-strategy"))
         let selectedIPSet = readState(from: dataRoot.appendingPathComponent("ipset-mode"))
         hudModel.running = running
@@ -180,17 +201,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hudModel.strategyName = strategies.first(where: { $0.id == selectedStrategy })?.name ?? selectedStrategy
         hudModel.ipsetMode = selectedIPSet.isEmpty ? "none" : selectedIPSet
         hudModel.loginEnabled = SMAppService.mainApp.status == .enabled
+        loadTestLive()
+        if testing || hud.isVisible {
+            probeServices(force: false)
+        }
+        hudModel.applyBestEnabled = !testing && !busy && hudModel.testRows.contains(where: { $0.isBest })
         if testing {
             let progress = readState(from: dataRoot.appendingPathComponent("strategy-test-progress"))
+            hudModel.testProgress = progress
             if cancellingTest {
                 hudModel.testTitle = "Остановка теста…"
             } else {
-                hudModel.testTitle = progress.isEmpty ? "Остановить тест" : "Остановить — \(progress)"
+                hudModel.testTitle = progress.isEmpty ? "Остановить тест" : "Остановить"
             }
             hudModel.testEnabled = !cancellingTest
         } else {
-            hudModel.testTitle = "Тест стратегий"
+            hudModel.testTitle = hudModel.testRows.isEmpty ? "Тест стратегий" : "Повторить тест"
             hudModel.testEnabled = !busy
+        }
+        if hudModel.page == .logs {
+            hudModel.logs = loadDiagnostics(limit: 90)
+        }
+        if hudModel.page == .lists {
+            hudModel.lists = listInfos()
         }
         if updating {
             hudModel.versionTitle = "Установка обновления…"
@@ -202,6 +235,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hudModel.versionTitle = "Версия \(currentVersion)"
             hudModel.canInstallUpdate = false
         }
+        if !running {
+            hudModel.discord = .off
+            hudModel.youtube = .off
+        }
+        let layoutKey = "\(hudModel.page)|\(testing)|\(hudModel.testRows.count)|\(hudModel.testBest)|\(hudModel.testProgress)|\(hudModel.notice)|\(hudModel.lists.count)|\(hudModel.editorName)|\(hudModel.logs.count)"
+        if hud.isVisible, layoutKey != lastLayoutKey {
+            lastLayoutKey = layoutKey
+            hud.relayout()
+        }
+    }
+
+    private func loadTestLive() {
+        let best = readState(from: dataRoot.appendingPathComponent("strategy-test-best"))
+        hudModel.testBest = best
+        let live = readState(from: dataRoot.appendingPathComponent("strategy-test-live.tsv"))
+        let bestNames = best
+        var rows: [TestRow] = []
+        for line in live.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard fields.count >= 3, !fields[0].isEmpty else { continue }
+            let score = fields[1] == "err" ? "ошибка" : "\(fields[1])/\(fields[2])"
+            let isBest = !bestNames.isEmpty && bestNames.contains(fields[0]) && bestNames.hasPrefix("Лучшая:")
+            rows.append(TestRow(name: fields[0], score: score, isBest: isBest))
+        }
+        hudModel.testRows = rows
+        if !testing {
+            hudModel.testProgress = ""
+        }
+    }
+
+    private func probeServices(force: Bool) {
+        let running = isRunning()
+        if !running {
+            hudModel.discord = .off
+            hudModel.youtube = .off
+            return
+        }
+        if !force, Date().timeIntervalSince(lastServiceProbe) < 12 { return }
+        lastServiceProbe = Date()
+        if hudModel.discord == .off || hudModel.discord == .unknown { hudModel.discord = .checking }
+        if hudModel.youtube == .off || hudModel.youtube == .unknown { hudModel.youtube = .checking }
+        probeURL("https://discord.com/") { [weak self] ok in
+            self?.hudModel.discord = ok ? .ok : .bad
+        }
+        probeURL("https://www.youtube.com/") { [weak self] ok in
+            self?.hudModel.youtube = ok ? .ok : .bad
+        }
+    }
+
+    private func probeURL(_ raw: String, done: @escaping (Bool) -> Void) {
+        guard let url = URL(string: raw) else {
+            done(false)
+            return
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            let ok: Bool
+            if error != nil {
+                ok = false
+            } else if let http = response as? HTTPURLResponse {
+                ok = (200..<500).contains(http.statusCode)
+            } else {
+                ok = false
+            }
+            DispatchQueue.main.async { done(ok) }
+        }.resume()
     }
 
     private func isRunning() -> Bool {
@@ -262,8 +362,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func openLists() {
-        NSWorkspace.shared.open(dataRoot.appendingPathComponent("lists", isDirectory: true))
+    private func openListsPage() {
+        hudModel.lists = listInfos()
+        hudModel.page = .lists
+        hud.relayout()
+    }
+
+    private func openList(_ name: String) {
+        let url = dataRoot.appendingPathComponent("lists", isDirectory: true).appendingPathComponent(name)
+        let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
+        if size > 80_000 {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        hudModel.editorName = name
+        hudModel.editorTitle = Self.listTitle(name)
+        hudModel.editorText = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        hudModel.page = .editor
+        hud.relayout()
+    }
+
+    private func saveCurrentList() {
+        let name = hudModel.editorName
+        guard !name.isEmpty else { return }
+        let url = dataRoot.appendingPathComponent("lists", isDirectory: true).appendingPathComponent(name)
+        do {
+            try hudModel.editorText.write(to: url, atomically: true, encoding: .utf8)
+            showNotice("Сохранено")
+            applyIfRunning()
+        } catch {
+            showError(error.localizedDescription)
+        }
+    }
+
+    private func openLogsPage() {
+        hudModel.logs = loadDiagnostics(limit: 90)
+        hudModel.page = .logs
+        hud.relayout()
+    }
+
+    private func copyLogs() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(hudModel.logs, forType: .string)
+        showNotice("Логи скопированы")
+    }
+
+    private func restartService() {
+        if isRunning() {
+            runPrivileged(script: "restart.sh", arguments: [])
+        }
+    }
+
+    private func openGitHub() {
+        if let url = URL(string: "https://github.com/samevamp/Nimbus") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func applyBestStrategy() {
+        if let name = hudModel.testRows.first(where: { $0.isBest })?.name {
+            applyNamedStrategy(name)
+        }
+    }
+
+    private func applyNamedStrategy(_ name: String) {
+        guard let id = strategies.first(where: { $0.name == name })?.id else {
+            showError("Не нашёл стратегию \(name)")
+            return
+        }
+        selectStrategy(id: id)
+        showNotice("Стратегия: \(name)")
+    }
+
+    private static func listTitle(_ name: String) -> String {
+        switch name {
+        case "list-general.txt": return "Основные"
+        case "list-general-user.txt": return "Основные"
+        case "list-google.txt": return "Google"
+        case "list-exclude.txt": return "Исключения"
+        case "list-exclude-user.txt": return "Исключения"
+        case "ipset-all.txt": return "IP-набор"
+        case "ipset-exclude.txt": return "IP исключения"
+        case "ipset-exclude-user.txt": return "IP исключения"
+        default: return name
+        }
+    }
+
+    private func listInfos() -> [ListInfo] {
+        let names = [
+            "list-general-user.txt",
+            "list-exclude-user.txt",
+            "ipset-exclude-user.txt",
+            "list-general.txt",
+            "list-google.txt",
+            "list-exclude.txt",
+            "ipset-exclude.txt",
+            "ipset-all.txt",
+        ]
+        let dir = dataRoot.appendingPathComponent("lists", isDirectory: true)
+        return names.compactMap { name in
+            let url = dir.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
+            let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
+            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let lines = text.split(whereSeparator: \.isNewline).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
+            let user = name.contains("-user")
+            return ListInfo(
+                id: name,
+                title: Self.listTitle(name),
+                detail: size > 80_000 ? "\(lines) строк · открыть" : "\(lines) строк",
+                badge: user ? "свои" : "",
+                external: size > 80_000
+            )
+        }
+    }
+
+    private func loadDiagnostics(limit: Int = 18) -> String {
+        let root = URL(fileURLWithPath: "/Library/Application Support/ZapretMac", isDirectory: true)
+        var chunks: [String] = []
+        for name in ["zapret.log", "engine.log"] {
+            let url = root.appendingPathComponent(name)
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+                let tail = lines.suffix(limit)
+                if !tail.isEmpty {
+                    chunks.append("— \(name) —\n" + tail.joined(separator: "\n"))
+                }
+            }
+        }
+        return chunks.joined(separator: "\n\n")
     }
 
     private func toggleLoginItem() {
@@ -441,7 +668,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func testStrategies() {
+        if busy { return }
         let report = dataRoot.appendingPathComponent("strategy-test.txt")
+        let live = dataRoot.appendingPathComponent("strategy-test-live.tsv")
+        let bestFile = dataRoot.appendingPathComponent("strategy-test-best")
         let cancel = dataRoot.appendingPathComponent("strategy-test-cancel")
         if testing {
             do {
@@ -453,42 +683,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Тест стратегий"
-        alert.informativeText = "Проверка будет выполняться в фоне, повторное нажатие остановит тест."
-        alert.addButton(withTitle: "Запустить")
-        alert.addButton(withTitle: "Отмена")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
         try? fileManager.removeItem(at: report)
+        try? fileManager.removeItem(at: live)
+        try? fileManager.removeItem(at: bestFile)
         try? fileManager.removeItem(at: cancel)
+        hudModel.testRows = []
+        hudModel.testBest = ""
+        hudModel.testProgress = "Подготовка"
+        hudModel.page = .more
         testing = true
         cancellingTest = false
+        refreshHUD()
+        if let button = statusItem.button, !hud.isVisible {
+            hud.show(relativeTo: button)
+        } else if hud.isVisible {
+            hud.relayout()
+        }
         runPrivileged(
             script: "test-strategies.sh",
             arguments: [dataRoot.path, String(getuid()), String(getgid())]
         ) { [weak self] failure in
             guard let self else { return }
-            let wasCancelled = self.cancellingTest
             self.testing = false
             self.cancellingTest = false
             try? self.fileManager.removeItem(at: cancel)
+            self.hudModel.page = .more
             self.refreshHUD()
-            guard failure == nil else { return }
-            if wasCancelled {
-                self.showInformation("Тест остановлен. Настройки восстановлены.")
-                return
+            if let button = self.statusItem.button, !self.hud.isVisible {
+                self.hud.show(relativeTo: button)
+            } else if self.hud.isVisible {
+                self.hud.relayout()
             }
-            guard let text = try? String(contentsOf: report, encoding: .utf8) else {
-                self.showError("Отчёт тестирования не найден")
-                return
+            if let failure {
+                self.showError(failure)
             }
-            let best = text.split(whereSeparator: \.isNewline)
-                .first { $0.hasPrefix("Лучшая:") }
-                .map(String.init) ?? "Тест завершён"
-            NSWorkspace.shared.open(report)
-            self.showInformation(best)
         }
     }
 
@@ -510,6 +738,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try self.fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
                 try self.fileManager.copyItem(at: payload, to: stagedPayload)
+                let shFiles = (try? self.fileManager.contentsOfDirectory(atPath: stagedPayload.path)) ?? []
+                for name in shFiles where name.hasSuffix(".sh") {
+                    try? self.fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stagedPayload.appendingPathComponent(name).path)
+                }
+                let utunwsPath = stagedPayload.appendingPathComponent("bin/utunws").path
+                if self.fileManager.fileExists(atPath: utunwsPath) {
+                    try? self.fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: utunwsPath)
+                }
                 var commandArguments = [stagedPayload.path]
                 if script == "install.sh" || script == "test-strategies.sh" {
                     commandArguments = [stagedPayload.path] + dataArguments
@@ -595,36 +831,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func serviceDiagnostics() -> String {
-        let root = URL(fileURLWithPath: "/Library/Application Support/ZapretMac", isDirectory: true)
-        for name in ["engine.log", "zapret.log"] {
-            let url = root.appendingPathComponent(name)
-            if let text = try? String(contentsOf: url, encoding: .utf8) {
-                let lines = text.split(whereSeparator: \.isNewline).suffix(18)
-                if !lines.isEmpty { return lines.joined(separator: "\n") }
+        loadDiagnostics(limit: 18)
+    }
+
+    private func updateMenuCloud(running: Bool) {
+        guard let button = statusItem.button else { return }
+        button.toolTip = running ? "Nimbus включён" : "Nimbus выключен"
+        button.contentTintColor = nil
+        if lastIconRunning != running {
+            lastIconRunning = running
+            button.image = templateCloud(running: running)
+            button.image?.isTemplate = true
+            if running {
+                startCloudBreath()
+            } else {
+                iconTimer?.invalidate()
+                iconTimer = nil
+                iconPhase = 0
+                button.alphaValue = 1
             }
         }
-        return ""
+    }
+
+    private func startCloudBreath() {
+        iconTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 24.0, repeats: true) { [weak self] _ in
+            guard let self, let button = self.statusItem.button else { return }
+            self.iconPhase += (2 * .pi) / (24 * 2.6)
+            let wave = (sin(self.iconPhase) + 1) / 2
+            button.alphaValue = 0.58 + 0.42 * wave
+        }
+        timer.tolerance = 0.01
+        RunLoop.main.add(timer, forMode: .common)
+        iconTimer = timer
+    }
+
+    private func showNotice(_ message: String, error: Bool = false) {
+        hudModel.notice = message
+        hudModel.noticeError = error
+        noticeTimer?.invalidate()
+        if !error {
+            noticeTimer = Timer.scheduledTimer(withTimeInterval: 3.2, repeats: false) { [weak self] _ in
+                self?.hudModel.notice = ""
+                if self?.hud.isVisible == true {
+                    self?.hud.relayout()
+                }
+            }
+        }
+        if hud.isVisible {
+            hud.relayout()
+        }
+    }
+
+    private func dismissNotice() {
+        noticeTimer?.invalidate()
+        hudModel.notice = ""
+        if hud.isVisible {
+            hud.relayout()
+        }
     }
 
     private func showError(_ message: String) {
         DispatchQueue.main.async {
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "Nimbus"
-            alert.informativeText = message
-            alert.runModal()
+            if self.statusItem == nil || self.hud == nil {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "Nimbus"
+                alert.informativeText = message
+                alert.runModal()
+                return
+            }
+            let compact = message.split(whereSeparator: \.isNewline).prefix(6).joined(separator: "\n")
+            self.showNotice(compact, error: true)
+            if let button = self.statusItem.button, !self.hud.isVisible {
+                self.hud.show(relativeTo: button)
+            }
         }
     }
 
     private func showInformation(_ message: String) {
         DispatchQueue.main.async {
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "Nimbus"
-            alert.informativeText = message
-            alert.runModal()
+            self.showNotice(message)
+            if let button = self.statusItem.button, !self.hud.isVisible {
+                self.hud.show(relativeTo: button)
+            }
         }
     }
 }
